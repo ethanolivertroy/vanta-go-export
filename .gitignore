@@ -1,0 +1,19 @@
+# Binaries
+vanta-exporter
+vanta-exporter.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Output
+export/
+
+# Go
+*.test
+*.out
+go.work
+go.work.sum
+
+# Env
+.env
