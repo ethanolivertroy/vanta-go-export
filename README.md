@@ -4,9 +4,44 @@ CLI tool to export Vanta audit evidence organized by control.
 
 ![screenshot](screenshot.png)
 
-## Build
+## Installation
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install ethanolivertroy/sectools/vanta-exporter
 ```
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add sectools https://github.com/ethanolivertroy/scoop-sectools
+scoop install vanta-exporter
+```
+
+### Download Binary
+
+Download from [Releases](https://github.com/ethanolivertroy/vanta-go-export/releases):
+
+| Platform | Binary |
+|----------|--------|
+| macOS (Apple Silicon) | `vanta-exporter-darwin-arm64` |
+| macOS (Intel) | `vanta-exporter-darwin-amd64` |
+| Linux (x64) | `vanta-exporter-linux-amd64` |
+| Linux (ARM64) | `vanta-exporter-linux-arm64` |
+| Windows (x64) | `vanta-exporter-windows-amd64.exe` |
+
+### Go Install
+
+```bash
+go install github.com/ethanolivertroy/vanta-go-export@latest
+```
+
+### Build from Source
+
+```bash
+git clone https://github.com/ethanolivertroy/vanta-go-export.git
+cd vanta-go-export
 go build -o vanta-exporter .
 ```
 
