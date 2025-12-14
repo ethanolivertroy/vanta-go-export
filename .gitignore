@@ -17,3 +17,6 @@ go.work.sum
 
 # Env
 .env
+
+# Agent docs
+AGENTS.md
