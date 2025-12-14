@@ -49,6 +49,8 @@ var (
 			Bold(true)
 )
 
+var downloadClient = &http.Client{Timeout: 60 * time.Second}
+
 // ============================================================================
 // API Types
 // ============================================================================
@@ -902,7 +904,7 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 				filePath := filepath.Join(d.controlDir, filename)
 				filePath = getUniqueFilename(filePath)
 
-				size, err := downloadFile(d.url.URL, filePath)
+				size, err := downloadFile(d.url.URL, filePath, outputDir)
 				mu.Lock()
 				downloaded++
 				sendProgress("download", downloaded, len(downloads), filename)
@@ -945,8 +947,14 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 			}
 
 			metadataPath := filepath.Join(controlDir, "metadata.json")
-			metadataJSON, _ := json.MarshalIndent(controlMetadata, "", "  ")
-			os.WriteFile(metadataPath, metadataJSON, 0644)
+			metadataJSON, err := json.MarshalIndent(controlMetadata, "", "  ")
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("Failed to marshal metadata for %s: %v", controlName, err))
+				continue
+			}
+			if err := os.WriteFile(metadataPath, metadataJSON, 0644); err != nil {
+				errors = append(errors, fmt.Sprintf("Failed to write metadata for %s: %v", controlName, err))
+			}
 		}
 
 		// Write master index CSV
@@ -971,13 +979,17 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 			TotalFilesExported:  totalFiles,
 			TotalControlFolders: len(controlMap),
 		}
-		auditInfoJSON, _ := json.MarshalIndent(auditInfo, "", "  ")
-		os.WriteFile(filepath.Join(outputDir, "_audit_info.json"), auditInfoJSON, 0644)
+		auditInfoJSON, err := json.MarshalIndent(auditInfo, "", "  ")
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("Failed to marshal audit info: %v", err))
+		} else if err := os.WriteFile(filepath.Join(outputDir, "_audit_info.json"), auditInfoJSON, 0644); err != nil {
+			errors = append(errors, fmt.Sprintf("Failed to write audit info: %v", err))
+		}
 
 		// Write errors log if any
 		if len(errors) > 0 {
 			errLog := strings.Join(errors, "\n")
-			os.WriteFile(filepath.Join(outputDir, "_errors.log"), []byte(errLog), 0644)
+			_ = os.WriteFile(filepath.Join(outputDir, "_errors.log"), []byte(errLog), 0644) // #nosec G104 - best effort
 		}
 
 		// Create zip archive
@@ -1001,8 +1013,40 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 // Helpers
 // ============================================================================
 
-func downloadFile(url, filepath string) (int64, error) {
-	resp, err := http.Get(url)
+func downloadFile(rawURL, destPath, baseDir string) (int64, error) {
+	// Validate URL to prevent SSRF attacks
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return 0, fmt.Errorf("invalid URL: %w", err)
+	}
+
+	// Only allow HTTPS URLs for security
+	if parsedURL.Scheme != "https" {
+		return 0, fmt.Errorf("only HTTPS URLs are allowed, got: %s", parsedURL.Scheme)
+	}
+
+	// Resolve absolute paths for proper comparison
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to resolve base directory: %w", err)
+	}
+	absDest, err := filepath.Abs(destPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to resolve destination path: %w", err)
+	}
+
+	// Verify the destination is within the base directory (path traversal protection)
+	relPath, err := filepath.Rel(absBase, absDest)
+	if err != nil || strings.HasPrefix(relPath, "..") || filepath.IsAbs(relPath) {
+		return 0, fmt.Errorf("invalid file path: path traversal detected")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, parsedURL.String(), nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := downloadClient.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -1012,7 +1056,7 @@ func downloadFile(url, filepath string) (int64, error) {
 		return 0, fmt.Errorf("bad status: %s", resp.Status)
 	}
 
-	out, err := os.Create(filepath)
+	out, err := os.Create(absDest)
 	if err != nil {
 		return 0, err
 	}
@@ -1022,15 +1066,26 @@ func downloadFile(url, filepath string) (int64, error) {
 }
 
 func sanitizeFilename(name string) string {
-	// Remove or replace invalid characters
+	// Extract just the filename component (removes any path elements)
+	name = filepath.Base(name)
+
+	// Remove or replace invalid characters for filenames
 	reg := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
 	name = reg.ReplaceAllString(name, "_")
+
 	// Trim spaces and dots from ends
 	name = strings.Trim(name, " .")
+
 	// Limit length
 	if len(name) > 200 {
 		name = name[:200]
 	}
+
+	// Ensure we have a valid filename
+	if name == "" || name == "." || name == ".." {
+		name = "unnamed"
+	}
+
 	return name
 }
 
@@ -1119,10 +1174,12 @@ func zipDirectory(sourceDir, zipPath string) error {
 		if err != nil {
 			return err
 		}
-		defer file.Close()
-
-		_, err = io.Copy(writer, file)
-		return err
+		_, copyErr := io.Copy(writer, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
 	})
 }
 
