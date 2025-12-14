@@ -904,7 +904,7 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 				filePath := filepath.Join(d.controlDir, filename)
 				filePath = getUniqueFilename(filePath)
 
-				size, err := downloadFile(d.url.URL, filePath)
+				size, err := downloadFile(d.url.URL, filePath, outputDir)
 				mu.Lock()
 				downloaded++
 				sendProgress("download", downloaded, len(downloads), filename)
@@ -1013,7 +1013,7 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 // Helpers
 // ============================================================================
 
-func downloadFile(rawURL, destPath string) (int64, error) {
+func downloadFile(rawURL, destPath, baseDir string) (int64, error) {
 	// Validate URL to prevent SSRF attacks
 	parsedURL, err := url.Parse(rawURL)
 	if err != nil {
@@ -1025,9 +1025,19 @@ func downloadFile(rawURL, destPath string) (int64, error) {
 		return 0, fmt.Errorf("only HTTPS URLs are allowed, got: %s", parsedURL.Scheme)
 	}
 
-	// Validate the path doesn't escape the intended directory
-	cleanPath := filepath.Clean(destPath)
-	if strings.Contains(cleanPath, "..") {
+	// Resolve absolute paths for proper comparison
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to resolve base directory: %w", err)
+	}
+	absDest, err := filepath.Abs(destPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to resolve destination path: %w", err)
+	}
+
+	// Verify the destination is within the base directory (path traversal protection)
+	relPath, err := filepath.Rel(absBase, absDest)
+	if err != nil || strings.HasPrefix(relPath, "..") || filepath.IsAbs(relPath) {
 		return 0, fmt.Errorf("invalid file path: path traversal detected")
 	}
 
@@ -1046,7 +1056,7 @@ func downloadFile(rawURL, destPath string) (int64, error) {
 		return 0, fmt.Errorf("bad status: %s", resp.Status)
 	}
 
-	out, err := os.Create(cleanPath)
+	out, err := os.Create(absDest)
 	if err != nil {
 		return 0, err
 	}
@@ -1056,13 +1066,11 @@ func downloadFile(rawURL, destPath string) (int64, error) {
 }
 
 func sanitizeFilename(name string) string {
-	// Prevent path traversal attacks
-	name = strings.ReplaceAll(name, "..", "_")
-	name = strings.ReplaceAll(name, "/", "_")
-	name = strings.ReplaceAll(name, "\\", "_")
+	// Extract just the filename component (removes any path elements)
+	name = filepath.Base(name)
 
-	// Remove or replace other invalid characters
-	reg := regexp.MustCompile(`[<>:"|?*\x00-\x1f]`)
+	// Remove or replace invalid characters for filenames
+	reg := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
 	name = reg.ReplaceAllString(name, "_")
 
 	// Trim spaces and dots from ends
@@ -1074,7 +1082,7 @@ func sanitizeFilename(name string) string {
 	}
 
 	// Ensure we have a valid filename
-	if name == "" {
+	if name == "" || name == "." || name == ".." {
 		name = "unnamed"
 	}
 
@@ -1166,9 +1174,12 @@ func zipDirectory(sourceDir, zipPath string) error {
 		if err != nil {
 			return err
 		}
-		_, err = io.Copy(writer, file)
-		file.Close()
-		return err
+		_, copyErr := io.Copy(writer, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
 	})
 }
 
