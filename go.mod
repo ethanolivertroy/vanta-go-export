@@ -1,6 +1,6 @@
 module vanta-exporter
 
-go 1.22
+go 1.24.0
 
 require (
 	github.com/charmbracelet/bubbles v0.21.0
