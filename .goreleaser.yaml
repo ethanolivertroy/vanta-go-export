@@ -65,3 +65,25 @@ scoops:
     homepage: "https://github.com/ethanolivertroy/vanta-go-export"
     description: "CLI tool to export Vanta audit evidence organized by control"
     license: "MIT"
+
+winget:
+  - name: vanta-exporter
+    publisher: ethanolivertroy
+    short_description: "CLI tool to export Vanta audit evidence organized by control"
+    license: MIT
+    publisher_url: https://github.com/ethanolivertroy
+    homepage: https://github.com/ethanolivertroy/vanta-go-export
+    tags:
+      - security
+      - vanta
+      - audit
+      - compliance
+      - evidence
+      - cli
+    repository:
+      owner: ethanolivertroy
+      name: winget-pkgs
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
