@@ -51,12 +51,14 @@ var (
 )
 
 var downloadClient = &http.Client{
-	Timeout: 60 * time.Second,
-	Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		},
-	},
+	Timeout:   60 * time.Second,
+	Transport: secureTransport(),
+}
+
+func secureTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	return t
 }
 
 // ============================================================================
@@ -206,12 +208,8 @@ func NewVantaClient(clientID, clientSecret string) *VantaClient {
 		clientID:     clientID,
 		clientSecret: clientSecret,
 		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					MinVersion: tls.VersionTLS12,
-				},
-			},
+			Timeout:   30 * time.Second,
+			Transport: secureTransport(),
 		},
 	}
 }
