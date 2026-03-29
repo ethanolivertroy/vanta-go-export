@@ -51,14 +51,48 @@ var (
 )
 
 var downloadClient = &http.Client{
-	Timeout:   60 * time.Second,
-	Transport: secureTransport(),
+	Timeout:       60 * time.Second,
+	Transport:     secureTransport(),
+	CheckRedirect: validateDownloadRedirect,
 }
 
 func secureTransport() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	return t
+}
+
+func validateDownloadRedirect(req *http.Request, via []*http.Request) error {
+	if req.URL == nil {
+		return fmt.Errorf("redirect missing URL")
+	}
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("redirected to non-HTTPS URL: %s", req.URL.String())
+	}
+	if len(via) == 0 {
+		return nil
+	}
+
+	originHost := normalizeHostname(via[0].URL.Hostname())
+	redirectHost := normalizeHostname(req.URL.Hostname())
+	if redirectHost == "" {
+		return fmt.Errorf("redirected URL missing host")
+	}
+	if !sameHostOrSubdomain(redirectHost, originHost) {
+		return fmt.Errorf("redirected to unexpected host: %s", redirectHost)
+	}
+
+	return nil
+}
+
+func normalizeHostname(host string) string {
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+func sameHostOrSubdomain(host, expected string) bool {
+	host = normalizeHostname(host)
+	expected = normalizeHostname(expected)
+	return host == expected || strings.HasSuffix(host, "."+expected)
 }
 
 // ============================================================================
@@ -242,7 +276,7 @@ func (c *VantaClient) authenticate() error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return fmt.Errorf("auth failed with status %d (%d bytes)", resp.StatusCode, len(body))
 	}
 
@@ -281,18 +315,18 @@ func (c *VantaClient) doRequest(method, endpoint string, params url.Values) ([]b
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, nil // Return nil for 404s
 		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return nil, fmt.Errorf("request failed with status %d (%d bytes)", resp.StatusCode, len(body))
 	}
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	return body, nil
 }
 
@@ -388,10 +422,10 @@ type auditsErrorMsg struct{ err error }
 type exportStartMsg struct{ audit Audit }
 
 type progressMsg struct {
-	phase    string // "evidence", "urls", "download"
-	current  int
-	total    int
-	detail   string
+	phase   string // "evidence", "urls", "download"
+	current int
+	total   int
+	detail  string
 }
 
 type downloadCompleteMsg struct {
@@ -418,12 +452,12 @@ const (
 
 type model struct {
 	// State
-	view       viewState
-	client     *VantaClient
-	audits     []Audit
+	view          viewState
+	client        *VantaClient
+	audits        []Audit
 	selectedAudit *Audit
-	outputDir  string
-	err        error
+	outputDir     string
+	err           error
 
 	// Credentials input
 	clientIDInput     textinput.Model
@@ -431,14 +465,14 @@ type model struct {
 	focusedInput      int // 0 = clientID, 1 = clientSecret
 
 	// Export progress
-	progressPhase   string
-	progressCurrent int
-	progressTotal   int
-	progressDetail  string
-	exportErrors    []string
+	progressPhase      string
+	progressCurrent    int
+	progressTotal      int
+	progressDetail     string
+	exportErrors       []string
 	totalFilesExported int
 	totalSizeExported  int64
-	exportOutputDir string
+	exportOutputDir    string
 
 	// Components
 	spinner  spinner.Model
@@ -788,6 +822,10 @@ func sendProgress(phase string, current, total int, detail string) {
 
 func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.Cmd {
 	return func() tea.Msg {
+		if err := ensurePrivateDir(baseOutputDir); err != nil {
+			return downloadCompleteMsg{errors: []string{err.Error()}, outputDir: baseOutputDir}
+		}
+
 		// Create output directory
 		customerName := audit.CustomerOrganizationName
 		if audit.CustomerDisplayName != nil && *audit.CustomerDisplayName != "" {
@@ -796,7 +834,7 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 		dirName := sanitizeFilename(fmt.Sprintf("%s_%s_%s", customerName, audit.Framework, audit.ID[:8]))
 		outputDir := filepath.Join(baseOutputDir, dirName)
 
-		if err := os.MkdirAll(outputDir, 0755); err != nil {
+		if err := ensurePrivateDir(outputDir); err != nil {
 			return downloadCompleteMsg{errors: []string{err.Error()}, outputDir: outputDir}
 		}
 
@@ -840,7 +878,7 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 		urlsProcessed := 0
 		for controlName, evidenceList := range controlMap {
 			controlDir := filepath.Join(outputDir, sanitizeFilename(controlName))
-			if err := os.MkdirAll(controlDir, 0755); err != nil {
+			if err := ensurePrivateDir(controlDir); err != nil {
 				errors = append(errors, fmt.Sprintf("Failed to create control dir %s: %v", controlName, err))
 				continue
 			}
@@ -888,9 +926,15 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 					controlNames[i] = c.Name
 				}
 				indexRows = append(indexRows, []string{
-					e.ID, e.Name, e.EvidenceType, e.Status, testStatus,
-					strings.Join(controlNames, "; "), fmt.Sprintf("%d", len(urls)),
-					formatDate(e.CreationDate), formatDate(e.StatusUpdatedDate),
+					escapeCSVCell(e.ID),
+					escapeCSVCell(e.Name),
+					escapeCSVCell(e.EvidenceType),
+					escapeCSVCell(e.Status),
+					escapeCSVCell(testStatus),
+					escapeCSVCell(strings.Join(controlNames, "; ")),
+					fmt.Sprintf("%d", len(urls)),
+					escapeCSVCell(formatDate(e.CreationDate)),
+					escapeCSVCell(formatDate(e.StatusUpdatedDate)),
 				})
 			}
 		}
@@ -965,18 +1009,24 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 				errors = append(errors, fmt.Sprintf("Failed to marshal metadata for %s: %v", controlName, err))
 				continue
 			}
-			if err := os.WriteFile(metadataPath, metadataJSON, 0600); err != nil {
+			if err := writeSecureFile(outputDir, metadataPath, metadataJSON); err != nil {
 				errors = append(errors, fmt.Sprintf("Failed to write metadata for %s: %v", controlName, err))
 			}
 		}
 
 		// Write master index CSV
 		indexPath := filepath.Join(outputDir, "_index.csv")
-		indexFile, err := os.OpenFile(indexPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-		if err == nil {
+		indexFile, err := openSecureOutputFile(outputDir, indexPath)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("Failed to open index CSV: %v", err))
+		} else {
 			writer := csv.NewWriter(indexFile)
-			writer.WriteAll(indexRows)
-			indexFile.Close()
+			if err := writer.WriteAll(indexRows); err != nil {
+				errors = append(errors, fmt.Sprintf("Failed to write index CSV: %v", err))
+			}
+			if err := indexFile.Close(); err != nil {
+				errors = append(errors, fmt.Sprintf("Failed to close index CSV: %v", err))
+			}
 		}
 
 		// Write audit info
@@ -995,14 +1045,14 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 		auditInfoJSON, err := json.MarshalIndent(auditInfo, "", "  ")
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("Failed to marshal audit info: %v", err))
-		} else if err := os.WriteFile(filepath.Join(outputDir, "_audit_info.json"), auditInfoJSON, 0600); err != nil {
+		} else if err := writeSecureFile(outputDir, filepath.Join(outputDir, "_audit_info.json"), auditInfoJSON); err != nil {
 			errors = append(errors, fmt.Sprintf("Failed to write audit info: %v", err))
 		}
 
 		// Write errors log if any
 		if len(errors) > 0 {
 			errLog := strings.Join(errors, "\n")
-			if writeErr := os.WriteFile(filepath.Join(outputDir, "_errors.log"), []byte(errLog), 0600); writeErr != nil {
+			if writeErr := writeSecureFile(outputDir, filepath.Join(outputDir, "_errors.log"), []byte(errLog)); writeErr != nil {
 				errors = append(errors, fmt.Sprintf("Failed to write error log: %v", writeErr))
 			}
 		}
@@ -1010,7 +1060,7 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 		// Create zip archive
 		sendProgress("zip", 0, 1, "Creating zip archive...")
 		zipPath := outputDir + ".zip"
-		if err := zipDirectory(outputDir, zipPath); err != nil {
+		if err := zipDirectory(outputDir, zipPath, baseOutputDir); err != nil {
 			errors = append(errors, fmt.Sprintf("Failed to create zip: %v", err))
 		}
 		sendProgress("zip", 1, 1, "Zip complete")
@@ -1040,22 +1090,6 @@ func downloadFile(rawURL, destPath, baseDir string) (int64, error) {
 		return 0, fmt.Errorf("only HTTPS URLs are allowed, got: %s", parsedURL.Scheme)
 	}
 
-	// Resolve absolute paths for proper comparison
-	absBase, err := filepath.Abs(baseDir)
-	if err != nil {
-		return 0, fmt.Errorf("failed to resolve base directory: %w", err)
-	}
-	absDest, err := filepath.Abs(destPath)
-	if err != nil {
-		return 0, fmt.Errorf("failed to resolve destination path: %w", err)
-	}
-
-	// Verify the destination is within the base directory (path traversal protection)
-	relPath, err := filepath.Rel(absBase, absDest)
-	if err != nil || strings.HasPrefix(relPath, "..") || filepath.IsAbs(relPath) {
-		return 0, fmt.Errorf("invalid file path: path traversal detected")
-	}
-
 	req, err := http.NewRequest(http.MethodGet, parsedURL.String(), nil)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create request: %w", err)
@@ -1071,13 +1105,121 @@ func downloadFile(rawURL, destPath, baseDir string) (int64, error) {
 		return 0, fmt.Errorf("bad status: %s", resp.Status)
 	}
 
-	out, err := os.OpenFile(absDest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	out, err := openSecureOutputFile(baseDir, destPath)
 	if err != nil {
 		return 0, err
 	}
 	defer out.Close()
 
 	return io.Copy(out, resp.Body)
+}
+
+func ensurePrivateDir(path string) error {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to use symlinked directory: %s", path)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	if err := os.MkdirAll(path, 0700); err != nil {
+		return err
+	}
+
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to use symlinked directory: %s", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("path is not a directory: %s", path)
+	}
+
+	return os.Chmod(path, 0700)
+}
+
+func resolveSecureOutputPath(baseDir, destPath string) (string, error) {
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve base directory: %w", err)
+	}
+	resolvedBase, err := filepath.EvalSymlinks(absBase)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve base directory symlinks: %w", err)
+	}
+
+	absDest, err := filepath.Abs(destPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve destination path: %w", err)
+	}
+
+	if info, err := os.Lstat(absDest); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("refusing to write through symlink: %s", absDest)
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	destDir := filepath.Dir(absDest)
+	resolvedDestDir, err := filepath.EvalSymlinks(destDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve destination directory symlinks: %w", err)
+	}
+
+	resolvedDest := filepath.Join(resolvedDestDir, filepath.Base(absDest))
+	relPath, err := filepath.Rel(resolvedBase, resolvedDest)
+	if err != nil || strings.HasPrefix(relPath, "..") || filepath.IsAbs(relPath) {
+		return "", fmt.Errorf("invalid file path: path traversal detected")
+	}
+
+	return resolvedDest, nil
+}
+
+func openSecureOutputFile(baseDir, destPath string) (*os.File, error) {
+	resolvedPath, err := resolveSecureOutputPath(baseDir, destPath)
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(resolvedPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Chmod(0600); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to set file permissions: %w", err)
+	}
+	return f, nil
+}
+
+func writeSecureFile(baseDir, destPath string, data []byte) error {
+	out, err := openSecureOutputFile(baseDir, destPath)
+	if err != nil {
+		return err
+	}
+
+	if _, err := out.Write(data); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+func escapeCSVCell(value string) string {
+	trimmed := strings.TrimLeft(value, " \t\r\n")
+	if trimmed == "" {
+		return value
+	}
+
+	switch trimmed[0] {
+	case '=', '+', '-', '@':
+		return "'" + value
+	default:
+		return value
+	}
 }
 
 func sanitizeFilename(name string) string {
@@ -1142,19 +1284,27 @@ func formatBytes(bytes int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
-func zipDirectory(sourceDir, zipPath string) error {
-	zipFile, err := os.OpenFile(zipPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+func zipDirectory(sourceDir, zipPath, baseDir string) (retErr error) {
+	zipFile, err := openSecureOutputFile(baseDir, zipPath)
 	if err != nil {
 		return err
 	}
-	defer zipFile.Close()
+	defer func() {
+		if closeErr := zipFile.Close(); retErr == nil && closeErr != nil {
+			retErr = closeErr
+		}
+	}()
 
 	archive := zip.NewWriter(zipFile)
-	defer archive.Close()
+	defer func() {
+		if closeErr := archive.Close(); retErr == nil && closeErr != nil {
+			retErr = closeErr
+		}
+	}()
 
-	baseDir := filepath.Base(sourceDir)
+	baseName := filepath.Base(sourceDir)
 
-	return filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+	retErr = filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -1168,7 +1318,7 @@ func zipDirectory(sourceDir, zipPath string) error {
 		if err != nil {
 			return err
 		}
-		header.Name = filepath.Join(baseDir, relPath)
+		header.Name = filepath.Join(baseName, relPath)
 
 		if info.IsDir() {
 			header.Name += "/"
@@ -1196,6 +1346,24 @@ func zipDirectory(sourceDir, zipPath string) error {
 		}
 		return closeErr
 	})
+	return
+}
+
+func resolveClientSecret(flagSecret string, useStdin bool, envSecret string, stdin io.Reader) (string, error) {
+	if flagSecret != "" && useStdin {
+		return "", fmt.Errorf("cannot use --client-secret and --client-secret-stdin together")
+	}
+	if flagSecret != "" {
+		return flagSecret, nil
+	}
+	if useStdin {
+		secretBytes, err := io.ReadAll(io.LimitReader(stdin, 1024*1024))
+		if err != nil {
+			return "", fmt.Errorf("failed to read client secret from stdin: %w", err)
+		}
+		return strings.TrimRight(string(secretBytes), "\r\n"), nil
+	}
+	return envSecret, nil
 }
 
 // ============================================================================
@@ -1209,7 +1377,8 @@ func main() {
 		output       = flag.String("output", "./export", "Output directory")
 		noTUI        = flag.Bool("no-tui", false, "Run without interactive TUI")
 		clientIDFlag = flag.String("client-id", "", "Vanta Client ID (or use VANTA_CLIENT_ID env var)")
-		secretFlag   = flag.String("client-secret", "", "Vanta Client Secret (or use VANTA_CLIENT_SECRET env var)")
+		secretFlag   = flag.String("client-secret", "", "Vanta Client Secret (discouraged: command-line args may be exposed in shell history or process listings)")
+		secretStdin  = flag.Bool("client-secret-stdin", false, "Read the Vanta client secret from stdin")
 	)
 	flag.Parse()
 
@@ -1218,20 +1387,24 @@ func main() {
 	if clientID == "" {
 		clientID = os.Getenv("VANTA_CLIENT_ID")
 	}
-	clientSecret := *secretFlag
-	if clientSecret == "" {
-		clientSecret = os.Getenv("VANTA_CLIENT_SECRET")
+	clientSecret, err := resolveClientSecret(*secretFlag, *secretStdin, os.Getenv("VANTA_CLIENT_SECRET"), os.Stdin)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Non-interactive mode requires credentials
 	if *noTUI || *auditID != "" || *all {
 		if clientID == "" || clientSecret == "" {
 			fmt.Println(errorStyle.Render("Error: Credentials required for non-interactive mode"))
-			fmt.Println("\nProvide via flags or environment variables:")
-			fmt.Println("  --client-id=vci_xxx --client-secret=vcs_xxx")
-			fmt.Println("  OR")
+			fmt.Println("\nProvide via environment variables, stdin, or a flag:")
 			fmt.Println("  export VANTA_CLIENT_ID=vci_xxx")
 			fmt.Println("  export VANTA_CLIENT_SECRET=vcs_xxx")
+			fmt.Println("  OR")
+			fmt.Println("  cat /path/to/client-secret | ./vanta-exporter --client-id=vci_xxx --client-secret-stdin --all")
+			fmt.Println("  OR")
+			fmt.Println("  ./vanta-exporter --client-id=vci_xxx --client-secret=vcs_xxx --all")
+			fmt.Println("\nWarning: --client-secret may be exposed via shell history or process listings.")
 			os.Exit(1)
 		}
 

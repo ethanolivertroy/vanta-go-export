@@ -30,6 +30,6 @@ This project employs the following security measures:
 - **Vulnerability scanning:** govulncheck for Go-specific vulnerabilities
 - **Static analysis:** GitHub CodeQL for code-level security issues
 - **Supply chain security:** Google OSV Scanner for dependency vulnerabilities; all GitHub Actions pinned to commit SHAs
-- **Transport security:** Explicit TLS 1.2 minimum on all HTTP connections
-- **Data protection:** Restrictive file permissions (0600) for exported compliance data
-- **Input validation:** HTTPS-only URL enforcement, path traversal protection, filename sanitization
+- **Transport security:** Explicit TLS 1.2 minimum on all HTTP connections and HTTPS-only redirect validation for file downloads
+- **Data protection:** Restrictive directory permissions (0700) and file permissions (0600) for exported compliance data
+- **Input validation:** Path traversal and symlink protection, filename sanitization, and CSV formula escaping
