@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -49,7 +50,14 @@ var (
 			Bold(true)
 )
 
-var downloadClient = &http.Client{Timeout: 60 * time.Second}
+var downloadClient = &http.Client{
+	Timeout: 60 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	},
+}
 
 // ============================================================================
 // API Types
@@ -197,7 +205,14 @@ func NewVantaClient(clientID, clientSecret string) *VantaClient {
 	return &VantaClient{
 		clientID:     clientID,
 		clientSecret: clientSecret,
-		httpClient:   &http.Client{Timeout: 30 * time.Second},
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					MinVersion: tls.VersionTLS12,
+				},
+			},
+		},
 	}
 }
 
@@ -230,7 +245,7 @@ func (c *VantaClient) authenticate() error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("auth failed with status %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("auth failed with status %d (%d bytes)", resp.StatusCode, len(body))
 	}
 
 	var tokenResp TokenResponse
@@ -277,7 +292,7 @@ func (c *VantaClient) doRequest(method, endpoint string, params url.Values) ([]b
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, nil // Return nil for 404s
 		}
-		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("request failed with status %d (%d bytes)", resp.StatusCode, len(body))
 	}
 
 	return body, nil
@@ -952,14 +967,14 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 				errors = append(errors, fmt.Sprintf("Failed to marshal metadata for %s: %v", controlName, err))
 				continue
 			}
-			if err := os.WriteFile(metadataPath, metadataJSON, 0644); err != nil {
+			if err := os.WriteFile(metadataPath, metadataJSON, 0600); err != nil {
 				errors = append(errors, fmt.Sprintf("Failed to write metadata for %s: %v", controlName, err))
 			}
 		}
 
 		// Write master index CSV
 		indexPath := filepath.Join(outputDir, "_index.csv")
-		indexFile, err := os.Create(indexPath)
+		indexFile, err := os.OpenFile(indexPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 		if err == nil {
 			writer := csv.NewWriter(indexFile)
 			writer.WriteAll(indexRows)
@@ -982,14 +997,16 @@ func exportAuditCmd(client *VantaClient, audit Audit, baseOutputDir string) tea.
 		auditInfoJSON, err := json.MarshalIndent(auditInfo, "", "  ")
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("Failed to marshal audit info: %v", err))
-		} else if err := os.WriteFile(filepath.Join(outputDir, "_audit_info.json"), auditInfoJSON, 0644); err != nil {
+		} else if err := os.WriteFile(filepath.Join(outputDir, "_audit_info.json"), auditInfoJSON, 0600); err != nil {
 			errors = append(errors, fmt.Sprintf("Failed to write audit info: %v", err))
 		}
 
 		// Write errors log if any
 		if len(errors) > 0 {
 			errLog := strings.Join(errors, "\n")
-			_ = os.WriteFile(filepath.Join(outputDir, "_errors.log"), []byte(errLog), 0644) // #nosec G104 - best effort
+			if writeErr := os.WriteFile(filepath.Join(outputDir, "_errors.log"), []byte(errLog), 0600); writeErr != nil {
+				errors = append(errors, fmt.Sprintf("Failed to write error log: %v", writeErr))
+			}
 		}
 
 		// Create zip archive
@@ -1056,7 +1073,7 @@ func downloadFile(rawURL, destPath, baseDir string) (int64, error) {
 		return 0, fmt.Errorf("bad status: %s", resp.Status)
 	}
 
-	out, err := os.Create(absDest)
+	out, err := os.OpenFile(absDest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return 0, err
 	}
@@ -1128,7 +1145,7 @@ func formatBytes(bytes int64) string {
 }
 
 func zipDirectory(sourceDir, zipPath string) error {
-	zipFile, err := os.Create(zipPath)
+	zipFile, err := os.OpenFile(zipPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
